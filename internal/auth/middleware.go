@@ -3,20 +3,20 @@ package auth
 import (
     "crypto/subtle"
     "encoding/base64"
+    "fmt"
     "net/http"
-    "strings"
+    "sync"
     "time"
 
     "github.com/yourusername/telegram-webdav/internal/config"
 )
 
-// BasicAuth middleware for WebDAV
+// BasicAuth handles WebDAV HTTP Basic Authentication
 func BasicAuth(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         username, password, ok := r.BasicAuth()
         if !ok {
-            w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV Storage"`)
-            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            unauthorized(w)
             return
         }
 
@@ -25,8 +25,7 @@ func BasicAuth(next http.Handler) http.Handler {
         validPass := subtle.ConstantTimeCompare([]byte(password), []byte(cfg.WebDAVPassword)) == 1
 
         if !validUser || !validPass {
-            w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV Storage"`)
-            http.Error(w, "Unauthorized", http.StatusUnauthorized)
+            unauthorized(w)
             return
         }
 
@@ -34,54 +33,68 @@ func BasicAuth(next http.Handler) http.Handler {
     })
 }
 
-// SessionAuth for web UI
-type SessionStore struct {
-    sessions map[string]sessionEntry
+func unauthorized(w http.ResponseWriter) {
+    w.Header().Set("WWW-Authenticate", `Basic realm="Telegram WebDAV"`)
+    http.Error(w, "Unauthorized", http.StatusUnauthorized)
 }
+
+// ======= Session Management =======
 
 type sessionEntry struct {
     username  string
     expiresAt time.Time
 }
 
-var sessions = &SessionStore{
-    sessions: make(map[string]sessionEntry),
-}
+var (
+    sessionsMu sync.RWMutex
+    sessionMap = make(map[string]sessionEntry)
+)
 
 func CreateSession(username string) string {
     token := base64.URLEncoding.EncodeToString([]byte(
         fmt.Sprintf("%s-%d", username, time.Now().UnixNano()),
     ))
-    sessions.sessions[token] = sessionEntry{
+    sessionsMu.Lock()
+    sessionMap[token] = sessionEntry{
         username:  username,
         expiresAt: time.Now().Add(24 * time.Hour),
     }
+    sessionsMu.Unlock()
     return token
 }
 
 func ValidateSession(token string) (string, bool) {
-    entry, ok := sessions.sessions[token]
-    if !ok {
-        return "", false
-    }
-    if time.Now().After(entry.expiresAt) {
-        delete(sessions.sessions, token)
+    sessionsMu.RLock()
+    entry, ok := sessionMap[token]
+    sessionsMu.RUnlock()
+
+    if !ok || time.Now().After(entry.expiresAt) {
+        if ok {
+            sessionsMu.Lock()
+            delete(sessionMap, token)
+            sessionsMu.Unlock()
+        }
         return "", false
     }
     return entry.username, true
 }
 
+func DestroySession(token string) {
+    sessionsMu.Lock()
+    delete(sessionMap, token)
+    sessionsMu.Unlock()
+}
+
+// WebAuth middleware for browser-based UI
 func WebAuth(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Check session cookie
         cookie, err := r.Cookie("session")
         if err != nil {
             http.Redirect(w, r, "/web/login", http.StatusFound)
             return
         }
 
-        _, ok := ValidateSession(cookie.Value)
-        if !ok {
+        if _, ok := ValidateSession(cookie.Value); !ok {
             http.Redirect(w, r, "/web/login", http.StatusFound)
             return
         }
@@ -90,22 +103,17 @@ func WebAuth(next http.Handler) http.Handler {
     })
 }
 
-// Fix missing import
-import "fmt"
-
 func init() {
-    // Cleanup expired sessions periodically
     go func() {
-        ticker := time.NewTicker(1 * time.Hour)
-        for range ticker.C {
+        for range time.Tick(time.Hour) {
             now := time.Now()
-            for token, entry := range sessions.sessions {
+            sessionsMu.Lock()
+            for token, entry := range sessionMap {
                 if now.After(entry.expiresAt) {
-                    delete(sessions.sessions, token)
+                    delete(sessionMap, token)
                 }
             }
+            sessionsMu.Unlock()
         }
     }()
 }
-
-// CorrectAuth - Fixed version without init import trick
